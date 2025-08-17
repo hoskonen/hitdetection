@@ -3,16 +3,25 @@ CombatProbe                    = CombatProbe or {}
 
 -- ---------- Config ----------
 CombatProbe.config             = {
-    enabled         = true,
-    pollEveryMs     = 150, -- fast edge poll
-    sampleEveryMs   = 500, -- slow probe while in combat
-    scanRadius      = 8.0, -- meters
-    maxPrint        = 4,  -- lines per sample
-    logHeartbeat    = true, -- “… in combat (heartbeat)”
-    dumpEntityOnce  = true, -- one-time basic dump per entity
-    dumpFactionOnce = true, -- show faction/superfaction/archetype once per enemy
-    dumpDerivedOnce = true, -- show STR/AGI/CHA once per enemy
-    primaryOnly     = false -- show only the ★ primary row per sample
+    enabled                 = true,
+    pollEveryMs             = 150,   -- fast edge poll
+    sampleEveryMs           = 500,   -- slow probe while in combat
+    scanRadius              = 8.0,   -- meters
+    maxPrint                = 4,     -- lines per sample
+    logHeartbeat            = false, -- “… in combat (heartbeat)”
+    dumpEntityOnce          = true,  -- one-time basic dump per entity
+    dumpFactionOnce         = true,  -- show faction/superfaction/archetype once per enemy
+    dumpDerivedOnce         = true,  -- show STR/AGI/CHA once per enemy
+    primaryOnly             = true,  -- show only the ★ primary row per sample
+    announceEnemiesOnEnter  = true,  -- list enemies once when combat begins
+    enemiesAnnounceMax      = 8,     -- at most this many lines in the list
+    -- perf toggles
+    useRay                  = true,  -- crosshair ray
+    useProjectToScreen      = true,  -- center bias
+    -- tracked set + refresh cadence
+    refreshEveryMs          = 3000,  -- rebuild/prune hostile set every 3s while in combat
+    -- adaptivity
+    maxHostilesForExpensive = 6      -- if more than this, skip ray + project for this sample
 }
 
 -- ---------- State ----------
@@ -28,6 +37,11 @@ CombatProbe._fallbackMs        = 0
 CombatProbe._hpGetterById      = CombatProbe._hpGetterById or {} -- [entityId] -> fn(e)->hp|nil
 CombatProbe._playerMetaDumped  = false
 CombatProbe._lastPrimaryId     = nil
+CombatProbe._tracked           = nil -- [id] = entity
+CombatProbe._lastRefresh       = 0
+CombatProbe._warnedNoHp        = {}  -- [id] -> true (one-shot warn)
+CombatProbe._announcedEnemies  = false
+CombatProbe._recentDamage      = {}  -- [id] = lastDamageTimeMs (for sticky after hit)
 
 -- ---------- Utils ----------
 local function Log(s) System.LogAlways("[CombatProbe] " .. tostring(s)) end
@@ -71,7 +85,7 @@ local function Dist(a, b)
 end
 local function IsHostile(e, player) return (e and e ~= player and (e.AI or e.soul)) or false end
 
--- HP getter cache (soul:GetHealth -> soul:GetState("health") -> actor:GetHealth -> entity:GetHealth)
+-- HP getter cache
 local function ResolveHpGetter(e)
     if e.soul and type(e.soul.GetHealth) == "function" then
         return function(ent)
@@ -105,7 +119,40 @@ local function GetEnemyHp(e)
     return getter and getter(e) or nil
 end
 
--- One-time dump per entity (includes faction/derived when available)
+local function IsEntityDead(e)
+    if not e then return false end
+    -- 1) explicit flags if present
+    if e.soul then
+        if e.soul.IsDead then
+            local ok, v = pcall(e.soul.IsDead, e.soul); if ok and (v == true or v == 1) then return true end
+        end
+        if e.soul.IsConscious then
+            local ok, v = pcall(e.soul.IsConscious, e.soul); if ok and (v == false or v == 0) then return true end
+        end
+    end
+    if e.actor and e.actor.IsDead then
+        local ok, v = pcall(e.actor.IsDead, e.actor); if ok and (v == true or v == 1) then return true end
+    end
+    -- 2) health threshold (not all builds hit exact 0)
+    local hp = GetEnemyHp(e)
+    if hp ~= nil then
+        if hp <= 1.0 then return true end
+    end
+    return false
+end
+
+local function FriendlyName(e)
+    local nm = (e.GetName and Try(e.GetName, e)) or "?"
+    if e.soul and e.soul.GetArchetype then
+        local at = Try(e.soul.GetArchetype, e.soul)
+        local arch = (type(at) == "table" and (at.name or at.class)) or nil
+        if arch then nm = arch .. " (" .. nm .. ")" end
+    end
+    if #nm > 28 then nm = nm:sub(1, 25) .. "…" end
+    return nm
+end
+
+-- One-time dump per entity
 local function DumpEntityOnce(e)
     if not CombatProbe.config.dumpEntityOnce then return end
     local id = e.id or tostring(e)
@@ -125,7 +172,7 @@ local function DumpEntityOnce(e)
         local superOrig    = Try(e.soul.GetSuperfaction, e.soul, "Original")
         local archetype    = Try(e.soul.GetArchetype, e.soul)
         local archName     = (type(archetype) == "table" and (archetype.name or archetype.class or archetype.id)) or
-        tostring(archetype)
+            tostring(archetype)
         Log(("meta: faction=%s super(Current)=%s super(Original)=%s archetype=%s")
             :format(tostring(factionId), tostring(superCurrent), tostring(superOrig), tostring(archName)))
     end
@@ -135,21 +182,21 @@ local function DumpEntityOnce(e)
         local str = select(2, pcall(e.soul.GetDerivedStat, e.soul, "str", ctx, used))
         local agi = select(2, pcall(e.soul.GetDerivedStat, e.soul, "agi", ctx, used))
         local cha = select(2, pcall(e.soul.GetDerivedStat, e.soul, "cha", ctx, used))
-        Log(("derived: STR=%s AGI=%s CHA=%s"):format(str and Round(str, 2) or "?", agi and Round(agi, 2) or "?",
-            cha and Round(cha, 2) or "?"))
+        Log(("derived: STR=%s AGI=%s CHA=%s")
+            :format(str and Round(str, 2) or "?", agi and Round(agi, 2) or "?", cha and Round(cha, 2) or "?"))
     end
 end
 
 -- Crosshair → FOV scoring → sticky primary
 local function PickByCrosshair(maxDist)
+    if not CombatProbe.config.useRay then return nil end
     if not (System.RayWorldIntersection and System.GetViewCameraPos and System.GetViewCameraDir) then return nil end
     local camPos = Try(System.GetViewCameraPos); local camDir = Try(System.GetViewCameraDir)
     if not (camPos and camDir) then return nil end
     local to = { x = camPos.x + camDir.x * maxDist, y = camPos.y + camDir.y * maxDist, z = camPos.z + camDir.z * maxDist }
     local ok, a, b, c, d, e = pcall(System.RayWorldIntersection, camPos,
         { x = to.x - camPos.x, y = to.y - camPos.y, z = to.z - camPos.z }, nil, nil, nil, nil)
-    local hits = ok and (a or b) or nil -- engine may return hits table in 1st result
-    hits = hits or a
+    local hits = ok and (a or b) or nil; hits = hits or a
     if not hits or not hits[1] then return nil end
     local h = hits[1]
     return h.entity or (h.entityId and System.GetEntity and System.GetEntity(h.entityId)) or nil
@@ -164,7 +211,7 @@ local function ScoreCandidate(ppos, e, lastPrimaryId)
     local vl = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) + 1e-6
     local dot = (v.x * camDir.x + v.y * camDir.y + v.z * camDir.z) / vl
     local centerBias = 0
-    if System.ProjectToScreen then
+    if CombatProbe.config.useProjectToScreen and System.ProjectToScreen then
         local ok, sx, sy = pcall(function()
             local sx, sy, _ = System.ProjectToScreen(epos); return sx, sy
         end)
@@ -176,7 +223,16 @@ local function ScoreCandidate(ppos, e, lastPrimaryId)
     local hp = GetEnemyHp(e)
     local deadPenalty = (hp == 0) and -1000 or 0
     local sticky = (((e.id or e) == lastPrimaryId) and 0.5) or 0
-    return (dot * 2.0) + (centerBias * 0.75) + sticky - (d * 0.15) + deadPenalty
+
+    -- NEW: brief boost if this candidate was damaged very recently
+    local recent = 0
+    do
+        local key = (e.id or e)
+        local t = CombatProbe._recentDamage and CombatProbe._recentDamage[key]
+        if t and (NowMs() - t <= 800) then recent = 0.6 end
+    end
+
+    return (dot * 2.0) + (centerBias * 0.75) + sticky + recent - (d * 0.15) + deadPenalty
 end
 
 local function PickPrimary(player, hostiles)
@@ -222,11 +278,15 @@ function CombatProbe.Check()
         CombatProbe._lastPlayerHealth  = Try(function() return player.soul:GetHealth() end)
         CombatProbe._lastPlayerStamina = Try(function()
             return (player.soul.GetStamina and player.soul:GetStamina()) or
-            (player.soul.GetExhaust and player.soul:GetExhaust())
+                (player.soul.GetExhaust and player.soul:GetExhaust())
         end)
+        CombatProbe._announcedEnemies  = false
+        CombatProbe._recentDamage      = {}
         Log(("⚔️ Entered combat (hp=%s st=%s)")
             :format(CombatProbe._lastPlayerHealth and Round(CombatProbe._lastPlayerHealth, 1) or "?",
                 CombatProbe._lastPlayerStamina and Round(CombatProbe._lastPlayerStamina, 1) or "?"))
+        CombatProbe._tracked = nil
+        CombatProbe._lastRefresh = 0
 
         -- player meta ONCE per combat
         if not CombatProbe._playerMetaDumped then
@@ -236,16 +296,25 @@ function CombatProbe.Check()
             local archName                = (type(pa) == "table" and (pa.name or pa.class or pa.id)) or tostring(pa)
             local ctx, used               = {}, {}
             local pstr                    = player.soul.GetDerivedStat and
-            (select(2, pcall(player.soul.GetDerivedStat, player.soul, "str", ctx, used)) or select(2, pcall(player.soul.GetDerivedStat, player.soul, "strength", ctx, used)))
+                (select(2, pcall(player.soul.GetDerivedStat, player.soul, "str", ctx, used)) or
+                    select(2, pcall(player.soul.GetDerivedStat, player.soul, "strength", ctx, used)))
             local pagi                    = player.soul.GetDerivedStat and
-            (select(2, pcall(player.soul.GetDerivedStat, player.soul, "agi", ctx, used)) or select(2, pcall(player.soul.GetDerivedStat, player.soul, "agility", ctx, used)))
+                (select(2, pcall(player.soul.GetDerivedStat, player.soul, "agi", ctx, used)) or
+                    select(2, pcall(player.soul.GetDerivedStat, player.soul, "agility", ctx, used)))
             Log(("player: faction=%s archetype=%s STR=%s AGI=%s")
                 :format(tostring(pf), tostring(archName), pstr and Round(pstr, 2) or "?", pagi and Round(pagi, 2) or "?"))
         end
     elseif (not inCombat) and CombatProbe._inCombat then
-        CombatProbe._inCombat = false
-        CombatProbe._lastEnemyHP = {}
+        CombatProbe._inCombat         = false
+        CombatProbe._lastEnemyHP      = {}
         CombatProbe._playerMetaDumped = false
+        CombatProbe._tracked          = nil
+        CombatProbe._lastRefresh      = 0
+        CombatProbe._hpGetterById     = {}
+        CombatProbe._dumpedEntities   = {}
+        CombatProbe._warnedNoHp       = {}
+        CombatProbe._announcedEnemies = false
+        CombatProbe._recentDamage     = {}
         Log("🕊️ Left combat")
     elseif inCombat and CombatProbe.config.logHeartbeat then
         Log("… in combat (heartbeat)")
@@ -253,15 +322,28 @@ function CombatProbe.Check()
 
     if not CombatProbe._inCombat then return end
 
-    -- Rate-limited sampling
+    -- Rate-limited sampling (clamped)
     local now = NowMs()
-    local period = CombatProbe.config.sampleEveryMs or 500
+    local period = math.max(CombatProbe.config.sampleEveryMs or 500,
+        CombatProbe.config.pollEveryMs or 150)
     if CombatProbe._lastSampleMs == 0 then CombatProbe._lastSampleMs = now - period end
     if now - CombatProbe._lastSampleMs < period then return end
     CombatProbe._lastSampleMs = now
 
     local ok, err = pcall(CombatProbe.Sample)
     if not ok then Log("[ERR] Sample(): " .. tostring(err)) end
+end
+
+local function BuildHostileSet(player, ppos)
+    local t = {}
+    for _, e in ipairs(GetEntitiesNear(ppos, CombatProbe.config.scanRadius)) do
+        if IsHostile(e, player) then t[e.id or e] = e end
+    end
+    return t
+end
+
+local function ToArray(map)
+    local arr = {}; for _, e in pairs(map) do arr[#arr + 1] = e end; return arr
 end
 
 -- ---------- Probe scan ----------
@@ -273,39 +355,141 @@ function CombatProbe.Sample()
         Log("sample: no player pos"); return
     end
 
-    local near = GetEntitiesNear(ppos, CombatProbe.config.scanRadius)
-    local hostiles = {}
-    for _, e in ipairs(near) do if IsHostile(e, player) then hostiles[#hostiles + 1] = e end end
+    -- build/refresh tracked set
+    if not CombatProbe._tracked then
+        CombatProbe._tracked = BuildHostileSet(player, ppos)
+        CombatProbe._lastRefresh = NowMs()
+    end
+
+    -- Announce enemy roster once per combat
+    if CombatProbe.config.announceEnemiesOnEnter and not CombatProbe._announcedEnemies then
+        CombatProbe._announcedEnemies = true
+        local arr = ToArray(CombatProbe._tracked)
+        -- build [dist, name, wuid, hp] list
+        local rows = {}
+        for _, e in ipairs(arr) do
+            local epos      = (e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
+            local dist      = (epos and Dist(ppos, epos)) or 999
+            local name      = FriendlyName(e)
+            local hp        = GetEnemyHp(e)
+            local wuid      = (e.soul and e.soul.GetId and Try(e.soul.GetId, e.soul)) or "?"
+            rows[#rows + 1] = { dist = dist, name = name, wuid = tostring(wuid), hp = hp }
+        end
+        table.sort(rows, function(a, b) return a.dist < b.dist end)
+        local nShown = 0
+        Log(("🎯 Enemies in range: %d"):format(#rows))
+        for i = 1, math.min(#rows, CombatProbe.config.enemiesAnnounceMax or 8) do
+            local r = rows[i]
+            Log(("  %d) %s | %s d=%.2f hp=%s"):format(
+                i, tostring(r.name), tostring(r.wuid), r.dist, r.hp and Round(r.hp, 1) or "?"))
+            nShown = nShown + 1
+        end
+        if #rows > nShown then
+            Log(("  …and %d more"):format(#rows - nShown))
+        end
+    end
+
+    -- periodic refresh: merge new + prune dead/far
+    local now = NowMs()
+    if now - (CombatProbe._lastRefresh or 0) >= (CombatProbe.config.refreshEveryMs or 3000) then
+        CombatProbe._lastRefresh = now
+        local snap = BuildHostileSet(player, ppos)
+        for k, e in pairs(snap) do CombatProbe._tracked[k] = e end
+        for k, e in pairs(CombatProbe._tracked) do
+            if not (e and (not e.id or (System.GetEntity and System.GetEntity(e.id)))) then
+                CombatProbe._tracked[k] = nil
+            else
+                local hp = GetEnemyHp(e)
+                local epos = e.GetWorldPos and e:GetWorldPos() or nil
+                local far = (epos and Dist(ppos, epos) or 999) > (CombatProbe.config.scanRadius * 1.5)
+                local deadFlag = IsEntityDead(e)
+                if deadFlag or far then CombatProbe._tracked[k] = nil end
+            end
+        end
+    end
+
+    local hostiles = ToArray(CombatProbe._tracked)
     if #hostiles == 0 then
-        Log("sample: no hostiles in radius"); return
+        Log("sample: no hostiles tracked"); return
+    end
+
+    -- adapt expensive features if many hostiles
+    local savedUseRay, savedUseProj = CombatProbe.config.useRay, CombatProbe.config.useProjectToScreen
+    local adapted = false
+    if #hostiles > (CombatProbe.config.maxHostilesForExpensive or 6) then
+        if CombatProbe.config.useRay then
+            CombatProbe.config.useRay = false; adapted = true
+        end
+        if CombatProbe.config.useProjectToScreen then
+            CombatProbe.config.useProjectToScreen = false; adapted = true
+        end
     end
 
     local primary = PickPrimary(player, hostiles)
     if primary then CombatProbe._lastPrimaryId = primary.id or primary end
 
-    -- Optionally focus only on primary
-    if CombatProbe.config.primaryOnly and primary then hostiles = { primary } end
+    if (CombatProbe.config.primaryOnly or (#hostiles > (CombatProbe.config.maxHostilesForExpensive or 6))) and primary then
+        hostiles = { primary }
+    end
 
     local printed = 0
     for _, e in ipairs(hostiles) do
         if printed >= CombatProbe.config.maxPrint then break end
+
         local id   = e.id or tostring(e)
-        local name = (e.GetName and Try(e.GetName, e)) or "?"
+        local name = FriendlyName(e)
         local epos = (e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
         local dist = (epos and Dist(ppos, epos)) or nil
         local hp   = GetEnemyHp(e)
         local last = CombatProbe._lastEnemyHP[id]
         local dhp  = (hp ~= nil and last ~= nil) and Round(hp - last, 1) or 0
-        if hp ~= nil then
-            -- death edge
-            if last and last > 0 and hp == 0 then Log(("☠️ %s has died (health 0)"):format(tostring(name))) end
-            CombatProbe._lastEnemyHP[id] = hp
+
+        -- record for ★ stickiness
+        if dhp < 0 then CombatProbe._recentDamage[id] = NowMs() end
+
+        -- warn once if we can't read HP
+        if hp == nil and not CombatProbe._warnedNoHp[id] then
+            CombatProbe._warnedNoHp[id] = true
+            Log(("warn: no HP getter for [%s] (class=%s)"):format(tostring(name), tostring(e.class or "?")))
         end
-        local mark = ((primary and (e.id or e) == (primary.id or primary)) and "★ " or "  ")
-        Log(("%srow: 👺[%s] d=%s hp=%s Δhp=%+s")
-            :format(mark, tostring(name), dist and Round(dist, 2) or "?", hp ~= nil and Round(hp, 1) or "?", dhp))
-        DumpEntityOnce(e)
-        printed = printed + 1
+
+        -- detect death on live sample
+        local justDied = false
+        if last and last > 0 then
+            if (hp == 0) or (hp and hp <= 1.0) or IsEntityDead(e) then
+                justDied = true
+                Log(("☠️ %s has died"):format(tostring(name)))
+                CombatProbe._tracked[id] = nil -- prune immediately
+            end
+        end
+
+        -- if the current ★ died, re-pick quickly
+        if justDied and primary and ((primary.id or primary) == id) then
+            CombatProbe._lastPrimaryId = nil
+            local tmp = {}
+            for _, x in ipairs(hostiles) do if (x.id or x) ~= id then tmp[#tmp + 1] = x end end
+            primary = PickPrimary(player, tmp)
+        end
+
+        -- skip printing a row for the dead guy
+        if justDied then
+            if hp ~= nil then CombatProbe._lastEnemyHP[id] = hp end
+        else
+            if hp ~= nil then CombatProbe._lastEnemyHP[id] = hp end
+            local mark     = ((primary and (e.id or e) == (primary.id or primary)) and "★ " or "  ")
+            local soulId   = (e.soul and e.soul.GetId and Try(e.soul.GetId, e.soul)) or "?"
+            local dhpPrint = (hp == 0) and "—" or ((dhp >= 0 and last ~= nil) and ("+" .. dhp) or tostring(dhp))
+            Log(("%srow: 👺[%s | %s] d=%s hp=%s Δhp=%s")
+                :format(mark, tostring(name), tostring(soulId),
+                    dist and Round(dist, 2) or "?", hp ~= nil and Round(hp, 1) or "?", dhpPrint))
+            DumpEntityOnce(e)
+            printed = printed + 1
+        end
+    end
+
+    if adapted then
+        CombatProbe.config.useRay = savedUseRay
+        CombatProbe.config.useProjectToScreen = savedUseProj
     end
 end
 

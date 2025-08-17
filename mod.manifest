@@ -1,0 +1,13 @@
+<kcd_mod>
+  <info>
+    <name>Hit Detection</name>
+    <modid>hitdetection</modid>
+    <description>Hit Detection Demo</description>
+    <author>hoskope</author>
+    <version>1.0</version>
+    <created_on>2025-08-07</created_on>
+  </info>
+  <supports>
+    <kcd_version>1.*</kcd_version>
+  </supports>
+</kcd_mod>

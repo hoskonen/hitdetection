@@ -8,7 +8,7 @@ CombatProbe.config             = {
     sampleEveryMs           = 500,   -- slow probe while in combat
     scanRadius              = 8.0,   -- meters
     maxPrint                = 4,     -- lines per sample
-    logHeartbeat            = false, -- “… in combat (heartbeat)”
+    logHeartbeat            = false, -- "… in combat (heartbeat)"
     dumpEntityOnce          = true,  -- one-time basic dump per entity
     dumpFactionOnce         = true,  -- show faction/superfaction/archetype once per enemy
     dumpDerivedOnce         = true,  -- show STR/AGI/CHA once per enemy
@@ -21,7 +21,10 @@ CombatProbe.config             = {
     -- tracked set + refresh cadence
     refreshEveryMs          = 3000,  -- rebuild/prune hostile set every 3s while in combat
     -- adaptivity
-    maxHostilesForExpensive = 6      -- if more than this, skip ray + project for this sample
+    maxHostilesForExpensive = 6,     -- if more than this, skip ray + project for this sample
+    deathHpThreshold        = 1.0,   -- treat hp <= this as dead
+    lingerMsOnFar           = 1500,  -- keep "recent" targets briefly even if far
+    logPruneReasons         = true   -- debug why we dropped a target
 }
 
 -- ---------- State ----------
@@ -37,11 +40,12 @@ CombatProbe._fallbackMs        = 0
 CombatProbe._hpGetterById      = CombatProbe._hpGetterById or {} -- [entityId] -> fn(e)->hp|nil
 CombatProbe._playerMetaDumped  = false
 CombatProbe._lastPrimaryId     = nil
-CombatProbe._tracked           = nil -- [id] = entity
+CombatProbe._tracked           = nil                         -- [id] = entity
 CombatProbe._lastRefresh       = 0
-CombatProbe._warnedNoHp        = {}  -- [id] -> true (one-shot warn)
+CombatProbe._warnedNoHp        = {}                          -- [id] -> true (one-shot warn)
 CombatProbe._announcedEnemies  = false
-CombatProbe._recentDamage      = {}  -- [id] = lastDamageTimeMs (for sticky after hit)
+CombatProbe._recentDamage      = {}                          -- [id] = lastDamageTimeMs (for sticky after hit)
+CombatProbe._lastSeen          = CombatProbe._lastSeen or {} -- [id] = lastSeenMs
 
 -- ---------- Utils ----------
 local function Log(s) System.LogAlways("[CombatProbe] " .. tostring(s)) end
@@ -135,9 +139,8 @@ local function IsEntityDead(e)
     end
     -- 2) health threshold (not all builds hit exact 0)
     local hp = GetEnemyHp(e)
-    if hp ~= nil then
-        if hp <= 1.0 then return true end
-    end
+    if hp ~= nil and hp <= (CombatProbe.config.deathHpThreshold or 1.0) then return true end
+
     return false
 end
 
@@ -287,6 +290,7 @@ function CombatProbe.Check()
                 CombatProbe._lastPlayerStamina and Round(CombatProbe._lastPlayerStamina, 1) or "?"))
         CombatProbe._tracked = nil
         CombatProbe._lastRefresh = 0
+        CombatProbe._lastSeen = {}
 
         -- player meta ONCE per combat
         if not CombatProbe._playerMetaDumped then
@@ -315,6 +319,7 @@ function CombatProbe.Check()
         CombatProbe._warnedNoHp       = {}
         CombatProbe._announcedEnemies = false
         CombatProbe._recentDamage     = {}
+        CombatProbe._lastSeen         = {}
         Log("🕊️ Left combat")
     elseif inCombat and CombatProbe.config.logHeartbeat then
         Log("… in combat (heartbeat)")
@@ -368,7 +373,7 @@ function CombatProbe.Sample()
         -- build [dist, name, wuid, hp] list
         local rows = {}
         for _, e in ipairs(arr) do
-            local epos      = (e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
+            local epos      = (e and e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
             local dist      = (epos and Dist(ppos, epos)) or 999
             local name      = FriendlyName(e)
             local hp        = GetEnemyHp(e)
@@ -395,15 +400,57 @@ function CombatProbe.Sample()
         CombatProbe._lastRefresh = now
         local snap = BuildHostileSet(player, ppos)
         for k, e in pairs(snap) do CombatProbe._tracked[k] = e end
+        -- periodic refresh: merge new + prune dead/far (with linger + reasons)
+
+        if far and lastHp and lastHp <= (CombatProbe.config.deathHpThreshold or 1.0) and CombatProbe.config.logPruneReasons then
+            Log(("note: %s FAR while low HP (lastHp=%s)"):format(tostring(k), Round(lastHp, 1)))
+        end
+
         for k, e in pairs(CombatProbe._tracked) do
-            if not (e and (not e.id or (System.GetEntity and System.GetEntity(e.id)))) then
+            local aliveHandle     = (e and (not e.id or (System.GetEntity and System.GetEntity(e.id))))
+            local lastHp          = CombatProbe._lastEnemyHP[k]
+            local lastSeen        = CombatProbe._lastSeen[k] or 0
+            local wasPrimary      = (CombatProbe._lastPrimaryId ~= nil and k == CombatProbe._lastPrimaryId)
+            local recentlyDamaged = CombatProbe._recentDamage and CombatProbe._recentDamage[k]
+                and (NowMs() - CombatProbe._recentDamage[k] <= 800)
+
+            local epos            = e and e.GetWorldPos and e:GetWorldPos() or nil
+            local dist            = (epos and Dist(ppos, epos)) or 999
+            local far             = dist > (CombatProbe.config.scanRadius * 1.5)
+
+            -- Linger window for far-away recent/primary targets
+            local lingerOk        = false
+            if far and (wasPrimary or recentlyDamaged) then
+                lingerOk = (NowMs() - lastSeen) <= (CombatProbe.config.lingerMsOnFar or 1500)
+            end
+
+            if not aliveHandle then
+                if CombatProbe.config.logPruneReasons then
+                    Log(("prune: %s DESPAWN (lastHp=%s)"):format(tostring(k), lastHp and Round(lastHp, 1) or "?"))
+                end
+                if lastHp and lastHp <= (CombatProbe.config.deathHpThreshold or 1.0) then
+                    local nm = (e and e.GetName and e:GetName()) or tostring(k)
+                    Log(("☠️ %s despawned near 0hp (assumed dead)"):format(tostring(nm)))
+                end
                 CombatProbe._tracked[k] = nil
             else
-                local hp = GetEnemyHp(e)
-                local epos = e.GetWorldPos and e:GetWorldPos() or nil
-                local far = (epos and Dist(ppos, epos) or 999) > (CombatProbe.config.scanRadius * 1.5)
                 local deadFlag = IsEntityDead(e)
-                if deadFlag or far then CombatProbe._tracked[k] = nil end
+                if deadFlag then
+                    if CombatProbe.config.logPruneReasons then
+                        local hpNow = GetEnemyHp(e)
+                        if CombatProbe.config.logPruneReasons then
+                            Log(("prune: %s DEAD (hp=%s)"):format(tostring(k), hpNow and Round(hpNow, 1) or "?"))
+                        end
+                    end
+                    CombatProbe._tracked[k] = nil
+                elseif far and not lingerOk then
+                    if CombatProbe.config.logPruneReasons then
+                        Log(("prune: %s FAR d=%.2f (lastHp=%s, linger=%s)"):format(
+                            tostring(k), dist, lastHp and Round(lastHp, 1) or "?",
+                            (wasPrimary or recentlyDamaged) and "kept briefly" or "no"))
+                    end
+                    CombatProbe._tracked[k] = nil
+                end
             end
         end
     end
@@ -436,13 +483,15 @@ function CombatProbe.Sample()
     for _, e in ipairs(hostiles) do
         if printed >= CombatProbe.config.maxPrint then break end
 
-        local id   = e.id or tostring(e)
-        local name = FriendlyName(e)
-        local epos = (e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
-        local dist = (epos and Dist(ppos, epos)) or nil
-        local hp   = GetEnemyHp(e)
-        local last = CombatProbe._lastEnemyHP[id]
-        local dhp  = (hp ~= nil and last ~= nil) and Round(hp - last, 1) or 0
+        local id                  = e.id or tostring(e)
+        local name                = FriendlyName(e)
+        local epos                = (e.GetWorldPos and Try(e.GetWorldPos, e)) or nil
+        local dist                = (epos and Dist(ppos, epos)) or nil
+        local hp                  = GetEnemyHp(e)
+        local last                = CombatProbe._lastEnemyHP[id]
+        local dhp                 = (hp ~= nil and last ~= nil) and Round(hp - last, 1) or 0
+
+        CombatProbe._lastSeen[id] = NowMs()
 
         -- record for ★ stickiness
         if dhp < 0 then CombatProbe._recentDamage[id] = NowMs() end
@@ -456,7 +505,7 @@ function CombatProbe.Sample()
         -- detect death on live sample
         local justDied = false
         if last and last > 0 then
-            if (hp == 0) or (hp and hp <= 1.0) or IsEntityDead(e) then
+            if (hp == 0) or (hp and hp <= (CombatProbe.config.deathHpThreshold or 1.0)) or IsEntityDead(e) then
                 justDied = true
                 Log(("☠️ %s has died"):format(tostring(name)))
                 CombatProbe._tracked[id] = nil -- prune immediately
@@ -479,7 +528,7 @@ function CombatProbe.Sample()
             local mark     = ((primary and (e.id or e) == (primary.id or primary)) and "★ " or "  ")
             local soulId   = (e.soul and e.soul.GetId and Try(e.soul.GetId, e.soul)) or "?"
             local dhpPrint = (hp == 0) and "—" or ((dhp >= 0 and last ~= nil) and ("+" .. dhp) or tostring(dhp))
-            Log(("%srow: 👺[%s | %s] d=%s hp=%s Δhp=%s")
+            Log(("%srow: 🛡️ [%s | %s] d=%s hp=%s Δhp=%s")
                 :format(mark, tostring(name), tostring(soulId),
                     dist and Round(dist, 2) or "?", hp ~= nil and Round(hp, 1) or "?", dhpPrint))
             DumpEntityOnce(e)
